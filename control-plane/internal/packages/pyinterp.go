@@ -194,10 +194,35 @@ func uvRequest(requires string) string {
 	return ""
 }
 
+// newestMinorBelow returns X.(Y-1) for an exclusive upper bound <X.Y in
+// requires, when that version satisfies the whole constraint.
+func newestMinorBelow(requires string) (pyVersion, bool) {
+	for _, clause := range strings.Split(requires, ",") {
+		clause = strings.TrimSpace(clause)
+		if !strings.HasPrefix(clause, "<") {
+			continue
+		}
+		if v, ok := parsePyVersion(strings.TrimPrefix(clause, "<")); ok && v.minor > 0 && v.patch == 0 {
+			newest := pyVersion{v.major, v.minor - 1, 0}
+			if constraintSatisfied(newest, requires) {
+				return newest, true
+			}
+		}
+	}
+	return pyVersion{}, false
+}
+
+// sdkRequiresPython is the Python SDK's requires-python (sdk/python/pyproject.toml).
+// Every Python node depends on agentfield, so a venv outside this range can't
+// install it whatever the node itself declares. Change it together with the
+// SDK; TestSDKRequiresPythonMatchesPyproject fails until they match.
+const sdkRequiresPython = ">=3.10, <3.15"
+
 // resolveVenvInterpreter picks the interpreter to build a node's venv with,
-// honoring the package's requires-python. It returns:
-//   - ("", nil) when the package declares no constraint — the caller keeps its
-//     legacy python3 -> python fallback, so behavior is unchanged.
+// honoring the package's requires-python together with sdkRequiresPython. It returns:
+//   - ("", nil) when the package declares no constraint and the ambient Python
+//     (if any runs) is in the SDK's range — the caller keeps its legacy
+//     python3 -> python fallback, so behavior is unchanged.
 //   - (interp, nil) with a concrete interpreter (command or path) to use.
 //   - ("", err) with an actionable message when a constraint is declared but no
 //     compatible interpreter is available and none can be provisioned.
@@ -206,28 +231,46 @@ func uvRequest(requires string) string {
 // it already satisfies, then a uv-provisioned interpreter (uv auto-downloads a
 // standalone build), then a matching pyenv-installed version.
 func resolveVenvInterpreter(packagePath string) (string, error) {
+	ambient, ambientV, ambientOK := ambientPythonInterpreter()
 	requires := readRequiresPython(packagePath)
+	why := fmt.Sprintf("this agent node requires %q and the agentfield SDK %q", requires, sdkRequiresPython)
 	if requires == "" {
-		return "", nil
+		if !ambientOK || constraintSatisfied(ambientV, sdkRequiresPython) {
+			return "", nil
+		}
+		// A python3 newer (or older) than the SDK supports would build a
+		// venv that can't install agentfield, so the SDK's range applies.
+		requires = sdkRequiresPython
+		why = fmt.Sprintf("the agentfield SDK requires %q", requires)
+	} else {
+		requires += ", " + sdkRequiresPython
 	}
 
 	// 1. Ambient interpreter already satisfies?
-	ambient, ambientV, ambientOK := ambientPythonInterpreter()
 	if ambientOK && constraintSatisfied(ambientV, requires) {
 		return ambient, nil
 	}
 
+	// When python3 is newer than allowed, ask uv for the newest minor below
+	// the upper bound rather than the lower bound (the SDK's is end of life).
+	// uvRequest keeps #727's bare major.minor request, and the error's
+	// install hints need one concrete version, so the range isn't passed as is.
+	provision := requires
+	if newest, ok := newestMinorBelow(requires); ok && ambientOK && ambientV.compare(newest) > 0 {
+		provision = fmt.Sprintf(">=%d.%d, %s", newest.major, newest.minor, requires)
+	}
+
 	// 2. Provision via uv (downloads a standalone interpreter if needed).
-	if interp := provisionViaUv(requires); interp != "" {
+	if interp := provisionViaUv(provision); interp != "" {
 		// clearLine() wipes the active dependency spinner's line so this notice
 		// lands cleanly on its own line instead of being appended to it.
-		fmt.Printf("%s  🐍 Provisioned Python %s via uv (node requires %q)\n", clearLine(), displayVersion(interp), requires)
+		fmt.Printf("%s  🐍 Provisioned Python %s via uv (%s)\n", clearLine(), displayVersion(interp), why)
 		return interp, nil
 	}
 
 	// 3. Discover a matching pyenv-installed version.
 	if interp := provisionViaPyenv(requires); interp != "" {
-		fmt.Printf("%s  🐍 Using pyenv Python %s (node requires %q)\n", clearLine(), displayVersion(interp), requires)
+		fmt.Printf("%s  🐍 Using pyenv Python %s (%s)\n", clearLine(), displayVersion(interp), why)
 		return interp, nil
 	}
 
@@ -235,18 +278,18 @@ func resolveVenvInterpreter(packagePath string) (string, error) {
 	if ambientOK {
 		found = fmt.Sprintf("found %s (Python %s)", ambient, ambientV)
 	}
-	req := uvRequest(requires)
+	req := uvRequest(provision)
 	if req == "" {
 		req = requires
 	}
 	return "", fmt.Errorf(
-		"this agent node requires Python %s, but no compatible interpreter is available (%s).\n"+
+		"%s, but no compatible interpreter is available (%s).\n"+
 			"Fix it by installing a matching Python, then reinstall:\n"+
 			"  • with uv (auto-downloads it):  uv python install %s\n"+
 			"  • or via pyenv:                 pyenv install %s\n"+
 			"  • or install Python %s from your OS package manager\n"+
 			"then ensure it is on PATH (or that uv/pyenv can see it) and run `af install` again",
-		requires, found, req, req, req)
+		why, found, req, req, req)
 }
 
 // firstOnPath returns the first of the given commands found on PATH, or "".

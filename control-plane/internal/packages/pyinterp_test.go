@@ -89,6 +89,30 @@ func TestUvRequest(t *testing.T) {
 	}
 }
 
+func TestNewestMinorBelow(t *testing.T) {
+	cases := []struct {
+		requires string
+		want     string // "" = none
+	}{
+		{">=3.10, <3.15", "3.14.0"},
+		{">=3.12, >=3.10, <3.15", "3.14.0"},
+		{">=3.10, <3.15, !=3.14.*", ""},
+		{">=3.10, <=3.14", ""},
+		{">=3.10, <3.14.2", ""},
+		{">=3.12", ""},
+	}
+	for _, c := range cases {
+		v, ok := newestMinorBelow(c.requires)
+		got := ""
+		if ok {
+			got = v.String()
+		}
+		if got != c.want {
+			t.Errorf("newestMinorBelow(%q) = %q; want %q", c.requires, got, c.want)
+		}
+	}
+}
+
 func TestReadRequiresPython(t *testing.T) {
 	t.Run("declared", func(t *testing.T) {
 		dir := t.TempDir()
@@ -122,10 +146,72 @@ func TestReadRequiresPython(t *testing.T) {
 // PATH so no real interpreter/uv/pyenv is involved.
 func TestResolveVenvInterpreter(t *testing.T) {
 	t.Run("no constraint keeps legacy fallback", func(t *testing.T) {
+		bin := t.TempDir()
+		stubPython(t, bin, "python3", "3.12.5")
+		t.Setenv("PATH", bin)
 		dir := t.TempDir() // no pyproject.toml
 		interp, err := resolveVenvInterpreter(dir)
 		if err != nil || interp != "" {
 			t.Fatalf("got (%q,%v); want empty interp, nil err", interp, err)
+		}
+	})
+
+	// python3 newer than the SDK supports: pip in a venv built with it finds
+	// no agentfield release, so the SDK's range applies even when the node
+	// declares nothing (a requirements.txt-only node).
+	t.Run("no constraint but ambient newer than the SDK supports -> uv", func(t *testing.T) {
+		bin := t.TempDir()
+		stubPython(t, bin, "python3", "3.15.2")
+		target := stubPython(t, bin, "managed-python", "3.14.10")
+		log := stubUvLogging(t, bin, target)
+		t.Setenv("PATH", bin)
+		dir := t.TempDir()
+
+		interp, err := resolveVenvInterpreter(dir)
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if interp != target {
+			t.Fatalf("got %q; want uv-provided %q", interp, target)
+		}
+		if calls := readFile(t, log); !strings.Contains(calls, "python install 3.14\n") {
+			t.Fatalf("uv should be asked for the newest supported Python (3.14); calls:\n%s", calls)
+		}
+	})
+
+	// Too old is #727's case: uv is still asked for the lower bound.
+	t.Run("no constraint and ambient older than the SDK supports -> uv lower bound", func(t *testing.T) {
+		bin := t.TempDir()
+		stubPython(t, bin, "python3", "3.9.6")
+		target := stubPython(t, bin, "managed-python", "3.10.18")
+		log := stubUvLogging(t, bin, target)
+		t.Setenv("PATH", bin)
+
+		interp, err := resolveVenvInterpreter(t.TempDir())
+		if err != nil || interp != target {
+			t.Fatalf("got (%q,%v); want uv-provided %q", interp, err, target)
+		}
+		if calls := readFile(t, log); !strings.Contains(calls, "python install 3.10\n") {
+			t.Fatalf("uv should be asked for 3.10; calls:\n%s", calls)
+		}
+	})
+
+	t.Run("node constraint still capped by the SDK range", func(t *testing.T) {
+		bin := t.TempDir()
+		stubPython(t, bin, "python3", "3.15.2") // satisfies the node's >=3.11 alone
+		t.Setenv("PATH", bin)
+		dir := t.TempDir()
+		writeFile(t, dir, "pyproject.toml", "[project]\nrequires-python = \">=3.11\"\n")
+
+		interp, err := resolveVenvInterpreter(dir)
+		if interp != "" || err == nil {
+			t.Fatalf("got (%q,%v); want an error", interp, err)
+		}
+		msg := err.Error()
+		for _, want := range []string{"<3.15", "3.15.2", "uv python install 3.14"} {
+			if !strings.Contains(msg, want) {
+				t.Fatalf("error should contain %q: %q", want, msg)
+			}
 		}
 	})
 
@@ -332,6 +418,39 @@ func TestInstallPythonDependencies_ProvisionsForRequiresPython(t *testing.T) {
 	}
 }
 
+// TestInstallPythonDependencies_ProvisionsWhenAmbientTooNew drives the
+// public API for a requirements.txt-only node on a machine whose python3 is
+// newer than the SDK supports: the venv must come from the uv-provided Python.
+// The ambient stub can't build a venv, so success proves it wasn't used.
+func TestInstallPythonDependencies_ProvisionsWhenAmbientTooNew(t *testing.T) {
+	bin := t.TempDir()
+	stubPython(t, bin, "python3", "3.15.2")
+	target := stubVenvPython(t, bin, "managed-python", "3.14.10")
+	stubUvLogging(t, bin, target)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	pkg := t.TempDir()
+	writeFile(t, pkg, "requirements.txt", "agentfield\n")
+
+	if err := InstallPythonDependencies(pkg, nil, nil); err != nil {
+		t.Fatalf("InstallPythonDependencies: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(pkg, "venv", "bin", "pip")); err != nil {
+		t.Fatalf("expected a venv built by the provisioned interpreter: %v", err)
+	}
+}
+
+// TestSDKRequiresPythonMatchesPyproject keeps sdkRequiresPython in step with
+// the Python SDK it stands for.
+func TestSDKRequiresPythonMatchesPyproject(t *testing.T) {
+	sdk := filepath.Join("..", "..", "..", "sdk", "python")
+	if _, err := os.Stat(filepath.Join(sdk, "pyproject.toml")); err != nil {
+		t.Skipf("Python SDK not in this checkout: %v", err)
+	}
+	if got := readRequiresPython(sdk); got != sdkRequiresPython {
+		t.Fatalf("sdk/python/pyproject.toml requires-python = %q, but sdkRequiresPython = %q; update the constant", got, sdkRequiresPython)
+	}
+}
+
 // --- test helpers ---
 
 // stubVenvPython writes an interpreter that reports `version` for -c and
@@ -393,4 +512,26 @@ func stubUv(t *testing.T, dir, findPath string) {
 	if err := os.WriteFile(p, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// stubUvLogging is stubUv that also appends each invocation's arguments to a
+// log file, whose path it returns.
+func stubUvLogging(t *testing.T, dir, findPath string) string {
+	t.Helper()
+	log := filepath.Join(dir, "uv.log")
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> \"" + log + "\"\n" +
+		"if [ \"$2\" = \"find\" ]; then echo \"" + findPath + "\"; fi\n" +
+		"exit 0\n"
+	writeExecutable(t, filepath.Join(dir, "uv"), script)
+	return log
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
 }
